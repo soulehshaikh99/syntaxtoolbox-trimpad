@@ -1,0 +1,18 @@
+{
+  "name": "syntaxtoolbox-trimpad",
+  "version": "1.0.0",
+  "description": "Trim whitespace borders, add uniform padding, encode to WebP via cwebp",
+  "type": "module",
+  "bin": {
+    "trimpad": "./main.js"
+  },
+  "engines": {
+    "node": ">=18.17"
+  },
+  "dependencies": {
+    "commander": "^12.1.0",
+    "fast-glob": "^3.3.2",
+    "p-limit": "^6.1.0",
+    "sharp": "^0.33.5"
+  }
+}
