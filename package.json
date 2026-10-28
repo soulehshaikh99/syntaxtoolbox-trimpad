@@ -1,7 +1,7 @@
 {
   "name": "syntaxtoolbox-trimpad",
   "version": "1.0.0",
-  "description": "Trim whitespace borders, add uniform padding, encode to WebP via cwebp",
+  "description": "Trim whitespace borders, add uniform padding, re-encode to same format, WebP (cwebp), PNG, JPG or AVIF",
   "type": "module",
   "bin": {
     "trimpad": "./main.js"
@@ -10,6 +10,7 @@
     "node": ">=18.17"
   },
   "dependencies": {
+    "@clack/prompts": "^1.8.1",
     "commander": "^12.1.0",
     "fast-glob": "^3.3.2",
     "p-limit": "^6.1.0",
