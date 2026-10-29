@@ -17,6 +17,21 @@ const FORMAT_EXT = { webp: '.webp', png: '.png', jpg: '.jpg', avif: '.avif' };
 const EXT_FORMAT = { '.webp': 'webp', '.png': 'png', '.jpg': 'jpg', '.jpeg': 'jpg', '.avif': 'avif' };
 // Added when the output would land on its own source (same format, same folder)
 const SUFFIX = '.trim';
+// Favicon set: [file name, square size]
+const FAVICON_PNGS = [
+  ['favicon-16x16.png', 16],
+  ['favicon-32x32.png', 32],
+  ['apple-touch-icon.png', 180],
+  ['android-chrome-192x192.png', 192],
+  ['android-chrome-512x512.png', 512],
+];
+const ICO_SIZES = [16, 32, 48];
+const FAVICON_HTML = [
+  '<link rel="icon" href="/favicon.ico" sizes="48x48">',
+  '<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">',
+  '<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">',
+  '<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">',
+].join('\n');
 
 const interactive = Boolean(process.stdin.isTTY && process.stdout.isTTY) && !p.isCI();
 
@@ -133,9 +148,8 @@ async function encode(buf, outPath, format, flatBg, o) {
   }
 }
 
-async function processFile({ file, out, format }, o) {
-  const origSize = (await fs.stat(file)).size;
-
+// Decode, trim borders, pad. Returns lossless PNG buffer + the border color used.
+async function trimPad(file, o) {
   // Decode to lossless PNG buffer (source decoded once; only the final encode is lossy)
   const src = await sharp(file).rotate().png({ compressionLevel: 0 }).toBuffer();
   const srcMeta = await sharp(src).metadata();
@@ -182,20 +196,84 @@ async function processFile({ file, out, format }, o) {
   }
   const fMeta = await sharp(finalBuf).metadata();
 
-  await fs.mkdir(path.dirname(out), { recursive: true });
-  await encode(finalBuf, out, format, transparent ? '#ffffff' : bg, o);
-
-  const newSize = (await fs.stat(out)).size;
   return {
-    file,
-    out,
+    buf: finalBuf,
+    bg,
+    transparent,
     trimmed,
     pad,
+    width: fMeta.width,
+    height: fMeta.height,
     from: `${srcMeta.width}x${srcMeta.height}`,
     to: `${fMeta.width}x${fMeta.height}`,
-    origSize,
-    newSize,
   };
+}
+
+async function processFile({ file, out, format }, o) {
+  const origSize = (await fs.stat(file)).size;
+  const { buf, bg, transparent, trimmed, pad, from, to } = await trimPad(file, o);
+
+  await fs.mkdir(path.dirname(out), { recursive: true });
+  await encode(buf, out, format, transparent ? '#ffffff' : bg, o);
+
+  const newSize = (await fs.stat(out)).size;
+  return { file, out, trimmed, pad, from, to, origSize, newSize };
+}
+
+// ICO container with PNG-compressed entries (supported by all current browsers)
+function buildIco(pngs) {
+  const header = Buffer.alloc(6 + 16 * pngs.length);
+  header.writeUInt16LE(0, 0); // reserved
+  header.writeUInt16LE(1, 2); // type: icon
+  header.writeUInt16LE(pngs.length, 4);
+  let offset = header.length;
+  pngs.forEach(({ size, data }, i) => {
+    const e = 6 + 16 * i;
+    header.writeUInt8(size >= 256 ? 0 : size, e); // width (0 = 256)
+    header.writeUInt8(size >= 256 ? 0 : size, e + 1); // height
+    header.writeUInt8(0, e + 2); // palette colors
+    header.writeUInt8(0, e + 3); // reserved
+    header.writeUInt16LE(1, e + 4); // color planes
+    header.writeUInt16LE(32, e + 6); // bits per pixel
+    header.writeUInt32LE(data.length, e + 8);
+    header.writeUInt32LE(offset, e + 12);
+    offset += data.length;
+  });
+  return Buffer.concat([header, ...pngs.map((x) => x.data)]);
+}
+
+const faviconOuts = (outDir) => [...FAVICON_PNGS.map(([name]) => name), 'favicon.ico'].map((n) => path.join(outDir, n));
+
+// Trim + pad source, center on square canvas, write full favicon set into outDir
+async function makeFavicons(file, outDir, o) {
+  const { buf, bg, transparent, trimmed, width, height, from } = await trimPad(file, o);
+  const side = Math.max(width, height);
+  const square = await sharp(buf)
+    .resize(side, side, { fit: 'contain', background: bg })
+    .png({ compressionLevel: 0 })
+    .toBuffer();
+
+  // flat: background for targets without alpha support (iOS renders transparency black)
+  const icon = (size, flat) => {
+    let s = sharp(square).resize(size, size);
+    if (flat) s = s.flatten({ background: flat });
+    return s.png({ compressionLevel: 9, adaptiveFiltering: true }).toBuffer();
+  };
+
+  await fs.mkdir(outDir, { recursive: true });
+  const written = [];
+  for (const [name, size] of FAVICON_PNGS) {
+    const flat = name === 'apple-touch-icon.png' && transparent ? '#ffffff' : null;
+    const out = path.join(outDir, name);
+    await fs.writeFile(out, await icon(size, flat));
+    written.push({ out, size: `${size}x${size}` });
+  }
+  const ico = buildIco(await Promise.all(ICO_SIZES.map(async (size) => ({ size, data: await icon(size) }))));
+  const icoOut = path.join(outDir, 'favicon.ico');
+  await fs.writeFile(icoOut, ico);
+  written.push({ out: icoOut, size: ICO_SIZES.map((s) => `${s}x${s}`).join(',') });
+
+  return { written, trimmed, from, side };
 }
 
 // Unwrap a clack answer; Ctrl+C / Esc exits
@@ -215,18 +293,44 @@ const numIn = (lo, hi) => (v) => {
 
 // Interactive wizard: fills in whatever was not passed as a flag
 async function wizard(o, given) {
+  if (!given('favicon')) {
+    const mode = await ask(
+      p.select({
+        message: 'What to do',
+        initialValue: 'trim',
+        options: [
+          { value: 'trim', label: 'Trim & pad images' },
+          { value: 'favicon', label: 'Generate favicon set', hint: 'ico + png sizes for a website' },
+        ],
+      })
+    );
+    o.favicon = mode === 'favicon';
+  }
+
   const input = await ask(
     p.path({
-      message: 'Input image or folder',
+      message: o.favicon ? 'Source image (logo)' : 'Input image or folder',
       root: process.cwd(),
       validate: (v) => {
         if (!v) return 'Required';
         const st = fsSync.statSync(v, { throwIfNoEntry: false });
         if (!st) return 'Not found';
+        if (o.favicon && !st.isFile()) return 'Must be a single .png, .jpg or .jpeg';
         if (st.isFile() && !EXTS.has(extOf(v))) return 'Must be .png, .jpg, .jpeg or a folder';
       },
     })
   );
+
+  if (o.favicon) {
+    if (!given('out')) {
+      const out = await ask(
+        p.text({ message: 'Output folder', placeholder: 'blank = favicon/ beside source', defaultValue: '' })
+      );
+      o.out = out.trim() || undefined;
+    }
+    await advancedPrompts(o, given, false);
+    return input;
+  }
 
   if (fsSync.statSync(input).isDirectory() && !given('recursive')) {
     o.recursive = await ask(p.confirm({ message: 'Include subfolders?', initialValue: false }));
@@ -289,8 +393,16 @@ async function wizard(o, given) {
     o.out = out.trim() || undefined;
   }
 
+  await advancedPrompts(o, given, true);
+  return input;
+}
+
+async function advancedPrompts(o, given, withConcurrency) {
   const advanced = await ask(
-    p.confirm({ message: 'Adjust padding, trim tolerance, background, concurrency?', initialValue: false })
+    p.confirm({
+      message: `Adjust padding, trim tolerance, background${withConcurrency ? ', concurrency' : ''}?`,
+      initialValue: false,
+    })
   );
   if (advanced) {
     if (!given('pad')) {
@@ -302,12 +414,61 @@ async function wizard(o, given) {
     if (!given('bg')) {
       o.bg = (await ask(p.text({ message: "Border color ('auto', 'white', '#fff', ...)", initialValue: o.bg }))).trim() || 'auto';
     }
-    if (!given('concurrency')) {
+    if (withConcurrency && !given('concurrency')) {
       o.concurrency = Number(await ask(p.text({ message: 'Parallel jobs', initialValue: String(o.concurrency), validate: numIn(1, 256) })));
     }
   }
+}
 
-  return input;
+// --favicon: one source image -> favicon.ico + png set in one folder
+async function runFavicon(input, o, wizardMode) {
+  const st = await fs.stat(input).catch(() => null);
+  if (!st) throw new Error(`Input not found: ${input}`);
+  if (!st.isFile() || !EXTS.has(extOf(input))) throw new Error('--favicon needs a single .png, .jpg or .jpeg');
+  const outDir = o.out ?? path.join(path.dirname(input), 'favicon');
+
+  if (wizardMode) {
+    p.note(
+      [
+        `Input:   ${input}`,
+        `Output:  ${outDir}`,
+        `Files:   favicon.ico (${ICO_SIZES.join('/')}), ${FAVICON_PNGS.length} png`,
+        `Pad ${o.pad}%  threshold ${o.threshold}  bg ${o.bg}`,
+      ].join('\n'),
+      'Settings'
+    );
+    if (!(await ask(p.confirm({ message: 'Start?' })))) {
+      p.cancel('Cancelled.');
+      process.exit(0);
+    }
+  }
+
+  // The set is all-or-nothing: no per-file skipping
+  if (!o.overwrite) {
+    const existing = [];
+    for (const f of faviconOuts(outDir)) if (await exists(f)) existing.push(f);
+    if (existing.length) {
+      if (!interactive) throw new Error(`${existing.length} favicon file(s) already exist in ${outDir}, use --overwrite`);
+      const go = await ask(
+        p.confirm({ message: `${existing.length} favicon file(s) already exist in ${outDir}. Overwrite?`, initialValue: false })
+      );
+      if (!go) {
+        p.cancel('Cancelled.');
+        process.exit(0);
+      }
+    }
+  }
+
+  const s = interactive ? p.spinner() : null;
+  s?.start('Generating favicons');
+  const r = await makeFavicons(input, outDir, o);
+  s?.stop('Generated favicons');
+
+  for (const { out, size } of r.written) p.log.success(`${path.basename(out)}  ${size}  ${kb((await fs.stat(out)).size)}`);
+  if (!r.trimmed) p.log.warn('Source not trimmed (blank image or nothing to trim)');
+  if (r.side < 512) p.log.warn(`Source is ${r.side}px after trim/pad; larger icons are upscaled (512px+ recommended)`);
+  p.note(FAVICON_HTML, 'Add to <head>');
+  p.outro(`Done: ${r.written.length} files in ${outDir}`);
 }
 
 function settingsNote(input, o, jobs) {
@@ -325,7 +486,7 @@ function settingsNote(input, o, jobs) {
 const program = new Command();
 program
   .name('trimpad')
-  .description('Trim whitespace borders, add uniform padding, re-encode (same format, WebP, PNG, JPG or AVIF)')
+  .description('Trim whitespace borders, add uniform padding, re-encode (same format, WebP, PNG, JPG or AVIF), or generate a favicon set')
   .argument('[input]', 'image file or folder (omit to run interactively)')
   .option('-o, --out <path>', 'output folder (or output file path for a single input)')
   .addOption(new Option('-F, --format <fmt>', 'output format (default: same)').choices(FORMATS))
@@ -336,6 +497,7 @@ program
   .option('--lossless', 'lossless (webp, avif)')
   .option('--near-lossless <n>', 'near-lossless 0-100, webp only (overrides -q)', num)
   .option('-r, --recursive', 'recurse into subfolders (folder input)')
+  .option('--favicon', 'generate website favicon set (favicon.ico + png sizes) from one image into --out (default: favicon/ beside source)')
   .option('-f, --overwrite', 'overwrite existing output files')
   .option('-c, --concurrency <n>', 'parallel jobs', num, Math.max(1, Math.floor(os.cpus().length / 2)))
   .action(async (input, o, cmd) => {
@@ -346,6 +508,16 @@ program
 
     p.intro('trimpad');
     if (wizardMode) input = await wizard(o, given);
+
+    if (o.favicon) {
+      try {
+        await runFavicon(input, o, wizardMode);
+      } catch (e) {
+        p.cancel(e.message);
+        process.exit(1);
+      }
+      return;
+    }
 
     let jobs;
     try {
